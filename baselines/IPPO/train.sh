@@ -1,0 +1,1 @@
+python ippo_rnn_smax.py hydra.mode=MULTIRUN GAGE_TOPK_INIT=1.4,2.2,3.0 SEED=0,1,2,3,4,5,6,7,8,9

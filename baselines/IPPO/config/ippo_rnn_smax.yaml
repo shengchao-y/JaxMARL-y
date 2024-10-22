@@ -3,7 +3,7 @@
 "NUM_STEPS": 128
 "GRU_HIDDEN_DIM": 128
 "FC_DIM_SIZE": 128
-"TOTAL_TIMESTEPS": 1e7
+"TOTAL_TIMESTEPS": 1e8
 "UPDATE_EPOCHS": 4
 "NUM_MINIBATCHES": 4
 "GAMMA": 0.99
@@ -15,7 +15,7 @@
 "MAX_GRAD_NORM": 0.25
 "ACTIVATION": "relu"
 "ENV_NAME": "HeuristicEnemySMAX"
-"MAP_NAME": "2s3z"
+"MAP_NAME": "5m_vs_6m"
 "SEED": 0
 "ENV_KWARGS": 
   "see_enemy_actions": True
@@ -24,6 +24,12 @@
 "ANNEAL_LR": True
 
 # WandB Params
-"ENTITY": ""
-"PROJECT": ""
-"WANDB_MODE" : "disabled"
+"ENTITY": "syan"
+"PROJECT": "jax"
+"WANDB_MODE" : "online" #"disabled" #
+
+# GAGE params
+"GAGE_TOPK_INIT": 2.0
+"OPTIM_GOAL": 1.0
+"GAGE_ETA1": 2.0
+"GAGE_ETA2": 1.0 # keep value 1.0

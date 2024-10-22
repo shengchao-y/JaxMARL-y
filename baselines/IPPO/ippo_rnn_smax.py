@@ -20,7 +20,7 @@ from jaxmarl.environments.smax import map_name_to_scenario, HeuristicEnemySMAX
 import wandb
 import functools
 import matplotlib.pyplot as plt
-
+import socket
 
 class ScannedRNN(nn.Module):
     @functools.partial(
@@ -55,7 +55,7 @@ class ActorCriticRNN(nn.Module):
     config: Dict
 
     @nn.compact
-    def __call__(self, hidden, x):
+    def __call__(self, hidden, x, gage_topk):
         obs, dones, avail_actions = x
         embedding = nn.Dense(
             self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
@@ -74,6 +74,26 @@ class ActorCriticRNN(nn.Module):
         )(actor_mean)
         unavail_actions = 1 - avail_actions
         action_logits = actor_mean - (unavail_actions * 1e10)
+
+        # gage action smoothing
+        max_logit = action_logits.max(axis=-1,keepdims=True)
+        distances = max_logit - action_logits
+        ind_reg = jnp.floor(gage_topk).astype(int)
+        distances_sort = distances.sort(axis=-1)
+        distance_kth = jax.lax.dynamic_slice_in_dim(distances_sort, ind_reg-1, 1, axis=-1)
+        distance_k1th = jax.lax.dynamic_slice_in_dim(distances_sort, ind_reg, 1, axis=-1)
+        ratio_k1th = gage_topk - ind_reg
+        distance_reg = (1-ratio_k1th) * distance_kth + ratio_k1th * distance_k1th
+        distance_reg = jnp.maximum(distance_reg, jnp.ones_like(distance_reg))
+        action_logits_smooth = -self.config["GAGE_ETA1"] * (distances / distance_reg)
+
+        # do not smooth if num of available actions is less than topk
+        inds_origin = avail_actions.sum(axis=-1,keepdims=True) < gage_topk
+        action_logits_origin = -self.config["GAGE_ETA1"] * (distances / 1.0)
+        inds_smooth = jnp.logical_not(inds_origin)
+        # jax.debug.breakpoint()
+        action_logits = action_logits_origin * inds_origin + action_logits_smooth * inds_smooth
+        # jax.debug.print("gage_topk: {}", gage_topk)
 
         pi = distrax.Categorical(logits=action_logits)
 
@@ -137,6 +157,10 @@ def make_train(config):
         return config["LR"] * frac
 
     def train(rng):
+        # init gage
+        gage_topk = config["GAGE_TOPK_INIT"]
+        goal_achieve = 0.0
+
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -148,7 +172,7 @@ def make_train(config):
             jnp.zeros((1, config["NUM_ENVS"], env.action_space(env.agents[0]).n)),
         )
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-        network_params = network.init(_rng, init_hstate, init_x)
+        network_params = network.init(_rng, init_hstate, init_x, gage_topk)
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -171,11 +195,14 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
         # TRAIN LOOP
-        def _update_step(update_runner_state, unused):
+        def _update_step(update_runner_state_gage, unused):
             # COLLECT TRAJECTORIES
+            update_runner_state, gage_params = update_runner_state_gage
             runner_state, update_steps = update_runner_state
+            gage_topk, goal_achieve = gage_params
 
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state_gage, unused):
+                runner_state, gage_topk = runner_state_gage
                 train_state, env_state, last_obs, last_done, hstate, rng = runner_state
 
                 # SELECT ACTION
@@ -190,7 +217,7 @@ def make_train(config):
                     last_done[np.newaxis, :],
                     avail_actions,
                 )
-                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
+                hstate, pi, value = network.apply(train_state.params, hstate, ac_in, gage_topk)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 env_act = unbatchify(
@@ -218,12 +245,13 @@ def make_train(config):
                     avail_actions,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng)
-                return runner_state, transition
+                return (runner_state, gage_topk), transition
 
             initial_hstate = runner_state[-2]
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+            runner_state_gage, traj_batch = jax.lax.scan(
+                _env_step, (runner_state, gage_topk), None, config["NUM_STEPS"]
             )
+            runner_state = runner_state_gage[0]
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, last_done, hstate, rng = runner_state
@@ -236,7 +264,7 @@ def make_train(config):
                 last_done[np.newaxis, :],
                 avail_actions,
             )
-            _, _, last_val = network.apply(train_state.params, hstate, ac_in)
+            _, _, last_val = network.apply(train_state.params, hstate, ac_in, gage_topk)
             last_val = last_val.squeeze()
 
             def _calculate_gae(traj_batch, last_val):
@@ -266,8 +294,9 @@ def make_train(config):
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
             # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+            def _update_epoch(update_state_gage, unused):
+                def _update_minbatch(train_state_gage, batch_info):
+                    train_state, gage_topk = train_state_gage
                     init_hstate, traj_batch, advantages, targets = batch_info
 
                     def _loss_fn(params, init_hstate, traj_batch, gae, targets):
@@ -276,6 +305,7 @@ def make_train(config):
                             params,
                             init_hstate.squeeze(),
                             (traj_batch.obs, traj_batch.done, traj_batch.avail_actions),
+                            gage_topk,
                         )
                         log_prob = pi.log_prob(traj_batch.action)
 
@@ -322,8 +352,9 @@ def make_train(config):
                         train_state.params, init_hstate, traj_batch, advantages, targets
                     )
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    return (train_state, gage_topk), total_loss
 
+                update_state, gage_topk = update_state_gage
                 (
                     train_state,
                     init_hstate,
@@ -363,9 +394,10 @@ def make_train(config):
                     shuffled_batch,
                 )
 
-                train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                train_state_gage, total_loss = jax.lax.scan(
+                    _update_minbatch, (train_state, gage_topk), minibatches
                 )
+                train_state = train_state_gage[0]
                 update_state = (
                     train_state,
                     init_hstate.squeeze(),
@@ -374,7 +406,7 @@ def make_train(config):
                     targets,
                     rng,
                 )
-                return update_state, total_loss
+                return (update_state, gage_topk), total_loss
 
             update_state = (
                 train_state,
@@ -384,9 +416,10 @@ def make_train(config):
                 targets,
                 rng,
             )
-            update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+            update_state_gage, loss_info = jax.lax.scan(
+                _update_epoch, (update_state, gage_topk), None, config["UPDATE_EPOCHS"]
             )
+            update_state = update_state_gage[0]
             train_state = update_state[0]
             metric = traj_batch.info
             metric = jax.tree_map(
@@ -428,11 +461,17 @@ def make_train(config):
                     }
                 )
 
+            win_rate = (metric["returned_won_episode"][:, :, 0] * metric["returned_episode"][:, :, 0]).sum() / (metric["returned_episode"][:, :, 0]).sum()
+            goal_achieve = 0.95 * goal_achieve + 0.05 * win_rate
+            gage_topk = jnp.clip(config["GAGE_TOPK_INIT"] * (1 - goal_achieve/config["OPTIM_GOAL"]), a_min=0) + 1
+            # jax.debug.breakpoint()
+            # jax.debug.print("gage_topk: {}", gage_topk)
+
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
-            return (runner_state, update_steps), metric
+            return ((runner_state, update_steps),(gage_topk, goal_achieve)), metric
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -443,9 +482,10 @@ def make_train(config):
             init_hstate,
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
+        runner_state_gage, metric = jax.lax.scan(
+            _update_step, ((runner_state, 0), (gage_topk, goal_achieve)), None, config["NUM_UPDATES"]
         )
+        runner_state = runner_state_gage[0]
         return {"runner_state": runner_state}
 
     return train
@@ -455,6 +495,7 @@ def make_train(config):
 def main(config):
     config = OmegaConf.to_container(config)
     wandb.init(
+        name=f'{socket.gethostname()}_{config["MAP_NAME"]}_k{config["GAGE_TOPK_INIT"]:.1f}-eta{config["GAGE_ETA1"]}_s{config["SEED"]}',
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN"],
