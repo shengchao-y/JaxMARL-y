@@ -28,8 +28,11 @@
 "PROJECT": "jax"
 "WANDB_MODE" : "online" #"disabled" #
 
-# GAGE params
-"GAGE_TOPK_INIT": 2.0
+## GAGE params
 "OPTIM_GOAL": 1.0
+# action smoothing
+"GAGE_TOPK_INIT": 2.0
 "GAGE_ETA1": 2.0
 "GAGE_ETA2": 1.0 # keep value 1.0
+# entropy control
+"GAGE_ENTROPY_INIT": 0.8
