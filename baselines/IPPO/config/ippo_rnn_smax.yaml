@@ -15,7 +15,7 @@
 "MAX_GRAD_NORM": 0.25
 "ACTIVATION": "relu"
 "ENV_NAME": "HeuristicEnemySMAX"
-"MAP_NAME": "5m_vs_6m"
+"MAP_NAME": "4m_vs_6m"
 "SEED": 0
 "ENV_KWARGS": 
   "see_enemy_actions": True
@@ -29,7 +29,7 @@
 "WANDB_MODE" : "online" #"disabled" #
 
 # GAGE params
-"GAGE_TOPK_INIT": 2.0
+"GAGE_TOPK_INIT": 1.4
 "OPTIM_GOAL": 1.0
 "GAGE_ETA1": 2.0
 "GAGE_ETA2": 1.0 # keep value 1.0
